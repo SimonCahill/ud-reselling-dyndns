@@ -1,2 +1,4 @@
 server
 properties.ini
+config.json
+bin/

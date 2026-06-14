@@ -1,0 +1,22 @@
+{
+  "user": "reseller-user",
+  "password": "replace-me",
+  "pollInterval": "1m",
+  "domains": [
+    {
+      "name": "example.com",
+      "cnameMaster": "www.example.com",
+      "subdomains": [
+        "home.example.com",
+        "vpn.example.com"
+      ]
+    },
+    {
+      "name": "example.net",
+      "cnameMaster": "www.example.net",
+      "subdomains": [
+        "home.example.net"
+      ]
+    }
+  ]
+}

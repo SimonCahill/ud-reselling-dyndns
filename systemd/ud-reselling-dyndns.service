@@ -1,0 +1,19 @@
+[Unit]
+Description=United Domains Reselling dynamic DNS updater
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ud-reselling-dyndns
+Group=ud-reselling-dyndns
+ExecStart=/usr/local/bin/ud-reselling-dyndns -config /etc/ud-reselling-dyndns/config.json
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

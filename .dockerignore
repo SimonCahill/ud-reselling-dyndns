@@ -1,0 +1,7 @@
+.git
+.gitignore
+bin
+config.json
+properties.ini
+Readme.md
+todo.txt
