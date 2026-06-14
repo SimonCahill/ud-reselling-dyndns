@@ -1,0 +1,153 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86-64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+            artifact: windows-x86-64
+            binary: ud-reselling-dyndns.exe
+          - name: Windows ARM64
+            runner: windows-11-arm
+            goos: windows
+            goarch: arm64
+            artifact: windows-arm64
+            binary: ud-reselling-dyndns.exe
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            artifact: linux-x86-64
+            binary: ud-reselling-dyndns
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact: linux-aarch64
+            binary: ud-reselling-dyndns
+          - name: macOS ARM64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+            artifact: macos-arm64
+            binary: ud-reselling-dyndns
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p "dist/${{ matrix.artifact }}"
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/${{ matrix.artifact }}/${{ matrix.binary }}" \
+            ./src
+          cp config.json.example "dist/${{ matrix.artifact }}/"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ud-reselling-dyndns-${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  linux-armhf:
+    name: Linux armhf
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Build test binary
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist/linux-armhf
+          go test -c -o dist/linux-armhf/ud-reselling-dyndns-tests ./src
+
+      - name: Test under QEMU
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            --volume "$PWD/dist/linux-armhf:/dist:ro" \
+            alpine:3.22 \
+            /dist/ud-reselling-dyndns-tests
+
+      - name: Vet
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: |
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dist/linux-armhf/ud-reselling-dyndns \
+            ./src
+          rm dist/linux-armhf/ud-reselling-dyndns-tests
+          cp config.json.example dist/linux-armhf/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ud-reselling-dyndns-linux-armhf
+          path: dist/linux-armhf
+          if-no-files-found: error
