@@ -210,11 +210,11 @@ GitHub Actions builds, tests, and uploads binaries for:
 
 The container workflow builds Linux images for amd64, arm/v7, and arm64. Every
 branch push, version tag, and manual workflow run publishes the image to GitHub
-Container Registry under `ghcr.io/simoncahill/ud-reselling-dyndns`. The default
-branch also publishes `latest`; version tags such as `v1.2.3` publish semantic
-version tags. Registry authentication and publication are mandatory, so either
-failure fails the workflow. Pull requests run the binary build and test
-workflow, but do not invoke the publishing workflow.
+Container Registry under `ghcr.io/simoncahill/ud-reselling-dyndns`. Every push
+to `master` also publishes `latest`; version tags such as `v1.2.3` publish
+semantic version tags. Registry authentication and publication are mandatory,
+so either failure fails the workflow. Pull requests run the binary build and
+test workflow, but do not invoke the publishing workflow.
 
 The software is provided without warranty. Use it only after confirming that
 the generated records represent the complete desired contents for each managed
