@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -31,12 +30,10 @@ func TestReadConfigSupportsMultipleDomainsAndSubdomains(t *testing.T) {
 		"domains": [
 			{
 				"name": "example.com",
-				"cnameMaster": "target.example.net",
 				"subdomains": ["home.example.com", "vpn.example.com"]
 			},
 			{
 				"name": "example.org.",
-				"cnameMaster": "target.example.net.",
 				"subdomains": ["home.example.org."]
 			}
 		]
@@ -65,9 +62,8 @@ func TestConfigRejectsSubdomainOutsideZone(t *testing.T) {
 		User:     "user",
 		Password: "password",
 		Domains: []DomainConfig{{
-			Name:        "example.com",
-			CNAMEMaster: "target.example.net",
-			Subdomains:  []string{"home.example.org"},
+			Name:       "example.com",
+			Subdomains: []string{"home.example.org"},
 		}},
 	}
 
@@ -81,28 +77,25 @@ func TestBuildUpdateFormIncludesEverySubdomain(t *testing.T) {
 
 	config := Config{User: "user", Password: "password"}
 	domain := DomainConfig{
-		Name:        "example.com",
-		CNAMEMaster: "target.example.net",
-		Subdomains:  []string{"home.example.com", "vpn.example.com"},
+		Name:       "example.com",
+		Subdomains: []string{"home.example.com", "vpn.example.com"},
 	}
-	updatedAt := time.Date(2026, time.June, 14, 12, 0, 0, 0, time.UTC)
 
-	values := buildUpdateForm(config, domain, "192.0.2.10", "2001:db8::10", updatedAt)
+	values := buildUpdateForm(config, domain, "192.0.2.10", "2001:db8::10")
 
 	wantRecords := map[string]string{
-		"rr0": "example.com. 3600 IN CNAME target.example.net.",
-		"rr1": "*.example.com. 3600 IN CNAME target.example.net.",
-		"rr2": "home.example.com. 600 IN A 192.0.2.10",
-		"rr3": "home.example.com. 600 IN AAAA 2001:db8::10",
-		"rr4": "home.example.com. 600 IN TXT 2026-06-14T12:00:00Z",
-		"rr5": "vpn.example.com. 600 IN A 192.0.2.10",
-		"rr6": "vpn.example.com. 600 IN AAAA 2001:db8::10",
-		"rr7": "vpn.example.com. 600 IN TXT 2026-06-14T12:00:00Z",
+		"rr0": "home.example.com. 600 IN A 192.0.2.10",
+		"rr1": "home.example.com. 600 IN AAAA 2001:db8::10",
+		"rr2": "vpn.example.com. 600 IN A 192.0.2.10",
+		"rr3": "vpn.example.com. 600 IN AAAA 2001:db8::10",
 	}
 	for key, want := range wantRecords {
 		if got := values.Get(key); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
+	}
+	if got := values.Get("rr4"); got != "" {
+		t.Errorf("rr4 = %q, want no additional records", got)
 	}
 }
 
@@ -136,13 +129,13 @@ func TestUpdateAllDomainsSendsOneRequestPerZone(t *testing.T) {
 		User:     "user",
 		Password: "password",
 		Domains: []DomainConfig{
-			{Name: "example.com", CNAMEMaster: "target.example.net", Subdomains: []string{"home.example.com"}},
-			{Name: "example.org", CNAMEMaster: "target.example.net", Subdomains: []string{"home.example.org"}},
+			{Name: "example.com", Subdomains: []string{"home.example.com"}},
+			{Name: "example.org", Subdomains: []string{"home.example.org"}},
 		},
 	}
 	u := updater{apiURL: "https://api.example.test/update", httpClient: client}
 
-	if err := u.updateAllDomains(context.Background(), config, "192.0.2.10", "2001:db8::10", time.Now()); err != nil {
+	if err := u.updateAllDomains(context.Background(), config, "192.0.2.10", "2001:db8::10"); err != nil {
 		t.Fatalf("updateAllDomains() error = %v", err)
 	}
 

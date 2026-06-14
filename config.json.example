@@ -5,15 +5,13 @@
   "domains": [
     {
       "name": "example.com",
-      "cnameMaster": "www.example.com",
-      "subdomains": [
+      "subdomains": [;
         "home.example.com",
         "vpn.example.com"
       ]
     },
     {
       "name": "example.net",
-      "cnameMaster": "www.example.net",
       "subdomains": [
         "home.example.net"
       ]
