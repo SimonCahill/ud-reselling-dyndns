@@ -3,7 +3,7 @@
 //
 // The client periodically discovers the host's public IPv4 and IPv6
 // addresses. When either address changes, it replaces each configured DNS
-// zone with generated apex, wildcard, and dynamic-subdomain records.
+// zone with generated A and AAAA records for its configured hostnames.
 package main
 
 import (
@@ -46,22 +46,18 @@ type Config struct {
 	// uses defaultPollInterval.
 	PollInterval string `json:"pollInterval,omitempty"`
 
-	// Domains lists the DNS zones to replace when an external address changes.
+	// Domains lists the DNS zones to update when an external address changes.
 	Domains []DomainConfig `json:"domains"`
 }
 
-// DomainConfig describes one DNS zone and its generated records.
+// DomainConfig describes one DNS zone and its dynamic hostnames.
 type DomainConfig struct {
 	// Name is the zone's fully qualified domain name, with or without a
 	// trailing dot.
 	Name string `json:"name"`
 
-	// CNAMEMaster is the target used for the zone apex and wildcard CNAME
-	// records.
-	CNAMEMaster string `json:"cnameMaster"`
-
 	// Subdomains contains fully qualified names within Name. Each name
-	// receives A, AAAA, and timestamp TXT records.
+	// receives one A and one AAAA record.
 	Subdomains []string `json:"subdomains"`
 }
 
@@ -188,9 +184,6 @@ func (config Config) validate() error {
 		}
 		seenDomains[domainName] = struct{}{}
 
-		if normalizeDNSName(domain.CNAMEMaster) == "" {
-			return fmt.Errorf("domains[%d].cnameMaster is required", i)
-		}
 		if len(domain.Subdomains) == 0 {
 			return fmt.Errorf("domains[%d].subdomains must contain at least one entry", i)
 		}
@@ -248,7 +241,7 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 		} else if ipv4 != lastIPv4 || ipv6 != lastIPv6 {
 			log.Printf("External IP address changed: IPv4=%s IPv6=%s", ipv4, ipv6)
 
-			if err := u.updateAllDomains(ctx, config, ipv4, ipv6, time.Now()); err != nil {
+			if err := u.updateAllDomains(ctx, config, ipv4, ipv6); err != nil {
 				log.Printf("DNS update failed: %v", err)
 			} else {
 				lastIPv4 = ipv4
@@ -319,10 +312,10 @@ func (u updater) getIP(ctx context.Context, endpoint string, wantIPv6 bool) (str
 
 // updateAllDomains submits one independent API request per configured DNS
 // zone. It attempts every zone and joins any errors for the caller.
-func (u updater) updateAllDomains(ctx context.Context, config Config, ipv4, ipv6 string, updatedAt time.Time) error {
+func (u updater) updateAllDomains(ctx context.Context, config Config, ipv4, ipv6 string) error {
 	var updateErrors []error
 	for _, domain := range config.Domains {
-		if err := u.updateDomain(ctx, config, domain, ipv4, ipv6, updatedAt); err != nil {
+		if err := u.updateDomain(ctx, config, domain, ipv4, ipv6); err != nil {
 			updateErrors = append(updateErrors, err)
 		}
 	}
@@ -337,9 +330,8 @@ func (u updater) updateDomain(
 	domain DomainConfig,
 	ipv4 string,
 	ipv6 string,
-	updatedAt time.Time,
 ) error {
-	values := buildUpdateForm(config, domain, ipv4, ipv6, updatedAt)
+	values := buildUpdateForm(config, domain, ipv4, ipv6)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.apiURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return fmt.Errorf("create update request for %s: %w", domain.Name, err)
@@ -365,11 +357,10 @@ func (u updater) updateDomain(
 }
 
 // buildUpdateForm constructs the form fields expected by UpdateDNSZone.
-// Record numbering is contiguous: apex and wildcard CNAME records come first,
-// followed by A, AAAA, and TXT records for each configured subdomain.
-func buildUpdateForm(config Config, domain DomainConfig, ipv4, ipv6 string, updatedAt time.Time) url.Values {
+// Record numbering is contiguous, with one A and one AAAA record for each
+// configured subdomain.
+func buildUpdateForm(config Config, domain DomainConfig, ipv4, ipv6 string) url.Values {
 	domainName := absoluteDNSName(domain.Name)
-	cnameMaster := absoluteDNSName(domain.CNAMEMaster)
 
 	values := url.Values{
 		"s_login": {config.User},
@@ -378,16 +369,12 @@ func buildUpdateForm(config Config, domain DomainConfig, ipv4, ipv6 string, upda
 		"dnszone": {domainName},
 	}
 
-	records := []string{
-		fmt.Sprintf("%s 3600 IN CNAME %s", domainName, cnameMaster),
-		fmt.Sprintf("*.%s 3600 IN CNAME %s", domainName, cnameMaster),
-	}
+	var records []string
 	for _, subdomain := range domain.Subdomains {
 		name := absoluteDNSName(subdomain)
 		records = append(records,
 			fmt.Sprintf("%s 600 IN A %s", name, ipv4),
 			fmt.Sprintf("%s 600 IN AAAA %s", name, ipv6),
-			fmt.Sprintf("%s 600 IN TXT %s", name, updatedAt.Format(time.RFC3339)),
 		)
 	}
 

@@ -8,10 +8,7 @@ On startup, and then at the configured interval, it:
 1. Fetches the public IPv4 and IPv6 addresses.
 2. Detects address changes.
 3. Sends one `UpdateDNSZone` request for each configured domain.
-4. Creates A, AAAA, and timestamp TXT records for every configured subdomain.
-
-Each configured zone also retains the original application's apex and wildcard
-CNAME records.
+4. Creates one A and one AAAA record for every configured subdomain.
 
 ## Configuration
 
@@ -31,7 +28,6 @@ chmod 600 config.json
   "domains": [
     {
       "name": "example.com",
-      "cnameMaster": "www.example.com",
       "subdomains": [
         "home.example.com",
         "vpn.example.com"
@@ -39,7 +35,6 @@ chmod 600 config.json
     },
     {
       "name": "example.net",
-      "cnameMaster": "www.example.net",
       "subdomains": [
         "home.example.net"
       ]
