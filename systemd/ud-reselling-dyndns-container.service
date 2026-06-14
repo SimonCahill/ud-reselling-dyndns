@@ -1,0 +1,22 @@
+[Unit]
+Description=United Domains Reselling dynamic DNS updater container
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Environment=DYNDNS_IMAGE=ghcr.io/simoncahill/ud-reselling-dyndns:latest
+EnvironmentFile=-/etc/default/ud-reselling-dyndns
+ExecStartPre=/usr/bin/docker pull ${DYNDNS_IMAGE}
+ExecStartPre=-/usr/bin/docker rm -f ud-reselling-dyndns
+ExecStart=/usr/bin/docker run --name ud-reselling-dyndns --read-only --cap-drop=ALL --security-opt=no-new-privileges --mount type=bind,source=/etc/ud-reselling-dyndns/config.json,target=/config/config.json,readonly ${DYNDNS_IMAGE}
+ExecStop=/usr/bin/docker stop -t 20 ud-reselling-dyndns
+ExecStopPost=-/usr/bin/docker rm -f ud-reselling-dyndns
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=0
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
