@@ -33,6 +33,7 @@ const (
 	defaultPollInterval = time.Minute
 	defaultServiceName  = "UDResellingDynDNS"
 	maxResponseBodySize = 64 * 1024
+	maxZoneResponseSize = 8 * 1024 * 1024
 	maxLoggedBodySize   = 4 * 1024
 )
 
@@ -407,6 +408,7 @@ func (u updater) updateDomain(
 	}
 
 	var updateErrors []error
+	updated := false
 	for _, subdomain := range domain.Subdomains {
 		name := normalizeDNSName(subdomain)
 		values := buildSubdomainUpdateForm(config, domain, subdomain, records, ipv4, ipv6)
@@ -432,6 +434,7 @@ func (u updater) updateDomain(
 			)
 			continue
 		}
+		updated = true
 		u.logf(
 			"\tUpdating subdomain %s to IPv4=%s IPv6=%s... OK",
 			name,
@@ -444,9 +447,12 @@ func (u updater) updateDomain(
 		return err
 	}
 
-	onlineRecords, err := u.queryDNSZoneRecords(ctx, config, domain)
-	if err != nil {
-		return fmt.Errorf("query DNS zone %s after update: %w", domain.Name, err)
+	onlineRecords := records
+	if updated {
+		onlineRecords, err = u.queryDNSZoneRecords(ctx, config, domain)
+		if err != nil {
+			return fmt.Errorf("query DNS zone %s after update: %w", domain.Name, err)
+		}
 	}
 
 	var verificationErrors []error
@@ -503,6 +509,10 @@ func buildSubdomainUpdateForm(
 		"s_pw":    {config.Password},
 		"command": {"UpdateDNSZone"},
 		"dnszone": {absoluteDNSName(domain.Name)},
+	}
+
+	if verifySubdomainRecords(subdomain, records, ipv4, ipv6) == nil {
+		return values
 	}
 
 	name := normalizeDNSName(subdomain)
@@ -646,9 +656,25 @@ func (u updater) callAPI(ctx context.Context, values url.Values) (apiResponse, e
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodySize))
+	responseLimit := responseBodyLimit(command)
+	body, err := io.ReadAll(io.LimitReader(response.Body, int64(responseLimit)+1))
 	if err != nil {
 		updateErr := fmt.Errorf("read %s response: %w", command, err)
+		u.logf(
+			"UDR API request failed: command=%s zone=%s status=%s error=%v",
+			command,
+			zone,
+			response.Status,
+			updateErr,
+		)
+		return apiResponse{}, updateErr
+	}
+	if len(body) > responseLimit {
+		updateErr := fmt.Errorf(
+			"read %s response: response exceeds %d-byte limit",
+			command,
+			responseLimit,
+		)
 		u.logf(
 			"UDR API request failed: command=%s zone=%s status=%s error=%v",
 			command,
@@ -697,6 +723,13 @@ func (u updater) callAPI(ctx context.Context, values url.Values) (apiResponse, e
 	return apiResult, nil
 }
 
+func responseBodyLimit(command string) int {
+	if command == "QueryDNSZoneRRList" {
+		return maxZoneResponseSize
+	}
+	return maxResponseBodySize
+}
+
 type recordChange struct {
 	key   string
 	value string
@@ -739,6 +772,7 @@ func formatUDRResponse(body []byte, credentials ...string) string {
 func parseAPIResponse(body string) (apiResponse, error) {
 	response := apiResponse{Properties: make(map[string][]string)}
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, maxResponseBodySize), maxZoneResponseSize)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		key, value, found := strings.Cut(line, "=")

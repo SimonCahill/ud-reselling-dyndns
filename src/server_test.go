@@ -180,6 +180,33 @@ func TestBuildSubdomainUpdateFormIncludesOnlyAvailableAddressFamilies(t *testing
 	}
 }
 
+func TestBuildSubdomainUpdateFormSkipsAlreadyCurrentRecords(t *testing.T) {
+	t.Parallel()
+
+	config := Config{User: "user", Password: "password"}
+	domain := DomainConfig{
+		Name:       "example.com",
+		Subdomains: []string{"home.example.com"},
+	}
+	records := []dnsRecord{
+		mustParseDNSRecord(t, "home.example.com. 600 IN A 192.0.2.10"),
+		mustParseDNSRecord(t, "home.example.com. 600 IN AAAA 2001:db8::10"),
+	}
+
+	values := buildSubdomainUpdateForm(
+		config,
+		domain,
+		"home.example.com",
+		records,
+		"192.0.2.10",
+		"2001:db8::10",
+	)
+
+	if hasRecordChanges(values) {
+		t.Errorf("buildSubdomainUpdateForm() = %v, want no record changes", values)
+	}
+}
+
 func mustParseDNSRecord(t *testing.T, raw string) dnsRecord {
 	t.Helper()
 	record, err := parseDNSRecord(raw)
@@ -426,11 +453,71 @@ func TestUpdateDomainFailsWhenOnlineZoneDoesNotContainChange(t *testing.T) {
 	}
 }
 
+func TestUpdateDomainSkipsAlreadyCurrentSubdomain(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	var queryCount int
+	var updateCount int
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if err := request.ParseForm(); err != nil {
+				return nil, err
+			}
+			switch request.PostForm.Get("command") {
+			case "QueryDNSZoneRRList":
+				queryCount++
+				return apiHTTPResponse(request, apiSuccess(
+					"home.example.com. 600 IN A 192.0.2.10",
+					"home.example.com. 600 IN AAAA 2001:db8::10",
+				)), nil
+			case "UpdateDNSZone":
+				updateCount++
+				return apiHTTPResponse(request, apiSuccess()), nil
+			default:
+				t.Fatalf("unexpected command %q", request.PostForm.Get("command"))
+				return nil, nil
+			}
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	config := Config{User: "user", Password: "password"}
+	domain := DomainConfig{
+		Name:       "example.com",
+		Subdomains: []string{"home.example.com"},
+	}
+
+	if err := u.updateDomain(
+		context.Background(),
+		config,
+		domain,
+		"192.0.2.10",
+		"2001:db8::10",
+	); err != nil {
+		t.Fatalf("updateDomain() error = %v", err)
+	}
+
+	if queryCount != 1 {
+		t.Errorf("QueryDNSZoneRRList count = %d, want 1", queryCount)
+	}
+	if updateCount != 0 {
+		t.Errorf("UpdateDNSZone count = %d, want 0", updateCount)
+	}
+	if got := logs.String(); !strings.Contains(got, "OK (already current)") {
+		t.Errorf("log output = %q, want already-current result", got)
+	}
+}
+
 func TestUpdateAllDomainsSendsOneRequestPerZone(t *testing.T) {
 	t.Parallel()
 
 	var updateZones []string
 	var updateZonesMu sync.Mutex
+	updatedZones := make(map[string]bool)
 	client := &http.Client{
 		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			if err := request.ParseForm(); err != nil {
@@ -442,14 +529,23 @@ func TestUpdateAllDomainsSendsOneRequestPerZone(t *testing.T) {
 			switch request.PostForm.Get("command") {
 			case "QueryDNSZoneRRList":
 				host := "home." + strings.TrimSuffix(zone, ".")
+				ipv4 := "192.0.2.1"
+				ipv6 := "2001:db8::1"
+				updateZonesMu.Lock()
+				if updatedZones[zone] {
+					ipv4 = "192.0.2.10"
+					ipv6 = "2001:db8::10"
+				}
+				updateZonesMu.Unlock()
 				return apiHTTPResponse(request, apiSuccess(
 					zone+" 600 IN SOA ns."+zone+" hostmaster."+zone+" 1 3600 600 86400 600",
-					host+". 600 IN A 192.0.2.10",
-					host+". 600 IN AAAA 2001:db8::10",
+					host+". 600 IN A "+ipv4,
+					host+". 600 IN AAAA "+ipv6,
 				)), nil
 			case "UpdateDNSZone":
 				updateZonesMu.Lock()
 				updateZones = append(updateZones, zone)
+				updatedZones[zone] = true
 				updateZonesMu.Unlock()
 				return apiHTTPResponse(request, apiSuccess()), nil
 			default:
@@ -494,6 +590,84 @@ func TestCallAPIRejectsBodyLevelError(t *testing.T) {
 	_, err := u.callAPI(context.Background(), url.Values{"command": {"UpdateDNSZone"}})
 	if err == nil || !strings.Contains(err.Error(), "API code 541: Permission denied") {
 		t.Fatalf("callAPI() error = %v, want API code error", err)
+	}
+}
+
+func TestCallAPIAllowsLargeZoneResponse(t *testing.T) {
+	t.Parallel()
+
+	var body strings.Builder
+	body.WriteString("[RESPONSE]\ncode = 200\ndescription = Command completed successfully\n")
+	const recordCount = 2000
+	for i := 0; i < recordCount; i++ {
+		fmt.Fprintf(
+			&body,
+			"property[RR][%d] = host-%d.example.com. 600 IN A 192.0.2.10\n",
+			i,
+			i,
+		)
+	}
+	body.WriteString("EOF\n")
+	if body.Len() <= maxResponseBodySize {
+		t.Fatalf("test response size = %d, want more than %d", body.Len(), maxResponseBodySize)
+	}
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return apiHTTPResponse(request, body.String()), nil
+		}),
+	}
+	u := updater{apiURL: "https://api.example.test/update", httpClient: client}
+
+	response, err := u.callAPI(context.Background(), url.Values{
+		"command": {"QueryDNSZoneRRList"},
+		"dnszone": {"example.com."},
+	})
+	if err != nil {
+		t.Fatalf("callAPI() error = %v", err)
+	}
+	if got := len(response.Properties["rr"]); got != recordCount {
+		t.Errorf("RR count = %d, want %d", got, recordCount)
+	}
+}
+
+func TestParseAPIResponseAllowsLongPropertyLine(t *testing.T) {
+	t.Parallel()
+
+	value := strings.Repeat("x", maxResponseBodySize)
+	body := "[RESPONSE]\ncode = 200\ndescription = Command completed successfully\n" +
+		"property[RR][0] = example.com. 600 IN TXT " + value + "\nEOF\n"
+
+	response, err := parseAPIResponse(body)
+	if err != nil {
+		t.Fatalf("parseAPIResponse() error = %v", err)
+	}
+	records := response.Properties["rr"]
+	if len(records) != 1 {
+		t.Fatalf("RR count = %d, want 1", len(records))
+	}
+	if !strings.HasSuffix(records[0], value) {
+		t.Errorf("RR value length = %d, want long property value preserved", len(records[0]))
+	}
+}
+
+func TestCallAPIRejectsResponseLargerThanCommandLimit(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("x", maxResponseBodySize+1)
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return apiHTTPResponse(request, body), nil
+		}),
+	}
+	u := updater{apiURL: "https://api.example.test/update", httpClient: client}
+
+	_, err := u.callAPI(context.Background(), url.Values{
+		"command": {"UpdateDNSZone"},
+		"dnszone": {"example.com."},
+	})
+	if err == nil || !strings.Contains(err.Error(), "response exceeds 65536-byte limit") {
+		t.Fatalf("callAPI() error = %v, want response limit error", err)
 	}
 }
 
