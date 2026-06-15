@@ -5,10 +5,15 @@ updates one or more DNS zones through the United Domains Reselling API.
 
 On startup, and then at the configured interval, it:
 
-1. Fetches the public IPv4 and IPv6 addresses.
-2. Detects address changes.
-3. Sends one `UpdateDNSZone` request for each configured domain.
-4. Creates one A and one AAAA record for every configured subdomain.
+1. Queries and logs every existing record in each configured DNS zone.
+2. Fetches the available public IPv4 and IPv6 addresses.
+3. Detects address changes.
+4. Replaces only the A and AAAA records for each configured subdomain.
+5. Queries the online zone again and verifies that the requested records are
+   present.
+
+Unconfigured records in the same DNS zone, including NS, MX, TXT, and records
+for other hostnames, are left unchanged.
 
 ## Configuration
 
@@ -65,9 +70,10 @@ error.
 
 Each UDR update logs:
 
-- The DNS zone and number of records being submitted.
-- Every generated `rrN` A or AAAA record.
+- The API command and DNS zone.
+- Every submitted `delrrN` and `addrrN` record change.
 - The HTTP status and response body returned by UDR.
+- Per-subdomain update and online verification results.
 - Transport, response-read, non-success HTTP, and explicit provider-reported
   failures, including failures returned with HTTP 200.
 
@@ -223,6 +229,4 @@ semantic version tags. Registry authentication and publication are mandatory,
 so either failure fails the workflow. Pull requests run the binary build and
 test workflow, but do not invoke the publishing workflow.
 
-The software is provided without warranty. Use it only after confirming that
-the generated records represent the complete desired contents for each managed
-DNS zone.
+The software is provided without warranty.
