@@ -517,6 +517,156 @@ func apiHTTPResponse(request *http.Request, body string) *http.Response {
 	}
 }
 
+func TestCallAPILogsChangesAndRedactedResponse(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return apiHTTPResponse(
+				request,
+				"[RESPONSE]\ncode = 200\ndescription = updated by reseller-user using secret\nEOF\n",
+			), nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	values := url.Values{
+		"s_login": {"reseller-user"},
+		"s_pw":    {"secret"},
+		"command": {"UpdateDNSZone"},
+		"dnszone": {"example.com."},
+		"delrr0":  {"home.example.com. 600 IN A 192.0.2.1"},
+		"addrr0":  {"home.example.com. 600 IN A 192.0.2.10"},
+	}
+
+	if _, err := u.callAPI(context.Background(), values); err != nil {
+		t.Fatalf("callAPI() error = %v", err)
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		`Submitting UDR API request: command=UpdateDNSZone zone=example.com`,
+		`delrr0="home.example.com. 600 IN A 192.0.2.1"`,
+		`addrr0="home.example.com. 600 IN A 192.0.2.10"`,
+		`status=200 OK`,
+		`description = updated by [REDACTED] using [REDACTED]`,
+		`UDR API request completed: command=UpdateDNSZone zone=example.com`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "reseller-user") || strings.Contains(output, "secret") {
+		t.Errorf("logs contain credentials:\n%s", output)
+	}
+}
+
+func TestCallAPILogsHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Body:       io.NopCloser(strings.NewReader("error=invalid zone")),
+				Header:     make(http.Header),
+				Request:    request,
+			}, nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+
+	_, err := u.callAPI(context.Background(), url.Values{
+		"command": {"UpdateDNSZone"},
+		"dnszone": {"example.com."},
+	})
+	if err == nil {
+		t.Fatal("callAPI() error = nil, want an error")
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		`UDR API response: command=UpdateDNSZone zone=example.com status=400 Bad Request body="error=invalid zone"`,
+		`UDR API request failed: command=UpdateDNSZone zone=example.com error=UpdateDNSZone: HTTP 400 Bad Request: error=invalid zone`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestCallAPILogsProviderFailureFromSuccessfulHTTPResponse(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return apiHTTPResponse(
+				request,
+				"[RESPONSE]\ncode = 541\ndescription = invalid credentials\nEOF\n",
+			), nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+
+	_, err := u.callAPI(context.Background(), url.Values{
+		"command": {"UpdateDNSZone"},
+		"dnszone": {"example.com."},
+	})
+	if err == nil {
+		t.Fatal("callAPI() error = nil, want an error")
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "API code 541: invalid credentials") {
+		t.Errorf("provider failure was not logged:\n%s", output)
+	}
+	if strings.Contains(output, "request completed:") {
+		t.Errorf("provider failure was logged as completed:\n%s", output)
+	}
+}
+
+func TestCallAPILogsTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("connection refused")
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+
+	if _, err := u.callAPI(context.Background(), url.Values{
+		"command": {"UpdateDNSZone"},
+		"dnszone": {"example.com."},
+	}); err == nil {
+		t.Fatal("callAPI() error = nil, want an error")
+	}
+	if output := logs.String(); !strings.Contains(output, "UDR API request failed: command=UpdateDNSZone zone=example.com") ||
+		!strings.Contains(output, "connection refused") {
+		t.Errorf("failure was not logged:\n%s", output)
+	}
+}
+
 func TestConfigJSONHasNoUnknownFields(t *testing.T) {
 	t.Parallel()
 

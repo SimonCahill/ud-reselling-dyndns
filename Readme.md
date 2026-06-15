@@ -68,6 +68,19 @@ The resulting binary is statically built and placed in `bin/`.
 Use `-log /path/to/file.log` to write logs to a file instead of standard
 error.
 
+Each UDR update logs:
+
+- The API command and DNS zone.
+- Every submitted `delrrN` and `addrrN` record change.
+- The HTTP status and response body returned by UDR.
+- Per-subdomain update and online verification results.
+- Transport, response-read, non-success HTTP, and explicit provider-reported
+  failures, including failures returned with HTTP 200.
+
+Reseller credentials are redacted if UDR includes them in its response. Response
+bodies are flattened to one line and truncated at 4 KiB to keep service logs
+manageable.
+
 ## Windows Server
 
 The application supports Windows Server as either an interactive console

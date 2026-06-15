@@ -32,6 +32,8 @@ const (
 	defaultIPv6URL      = "https://ipv6.myexternalip.com/raw"
 	defaultPollInterval = time.Minute
 	defaultServiceName  = "UDResellingDynDNS"
+	maxResponseBodySize = 64 * 1024
+	maxLoggedBodySize   = 4 * 1024
 )
 
 // Config contains the reseller credentials and DNS zones managed by the
@@ -68,6 +70,7 @@ type updater struct {
 	ipv4URL    string
 	ipv6URL    string
 	httpClient *http.Client
+	logger     *log.Logger
 }
 
 type apiResponse struct {
@@ -113,6 +116,7 @@ func main() {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		logger: log.Default(),
 	}
 
 	run := func(ctx context.Context) error {
@@ -254,9 +258,9 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 	for {
 		ipv4, ipv6, err := u.externalIPs(ctx)
 		if err != nil {
-			log.Printf("Unable to determine external IP addresses: %v", err)
+			u.logf("Unable to determine external IP addresses: %v", err)
 		} else if ipv4 != lastIPv4 || ipv6 != lastIPv6 {
-			log.Printf(
+			u.logf(
 				"External IP address change detected: IPv4 %s -> %s, IPv6 %s -> %s",
 				displayIPAddress(lastIPv4),
 				displayIPAddress(ipv4),
@@ -265,7 +269,7 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 			)
 
 			if err := u.updateAllDomains(ctx, config, ipv4, ipv6); err != nil {
-				log.Printf("DNS update failed: %v", err)
+				u.logf("DNS update failed: %v", err)
 			} else {
 				lastIPv4 = ipv4
 				lastIPv6 = ipv6
@@ -280,18 +284,28 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 	}
 }
 
+// logf writes through the updater's logger when one is configured and falls
+// back to the process-wide logger for callers that construct updater directly.
+func (u updater) logf(format string, arguments ...any) {
+	if u.logger != nil {
+		u.logger.Printf(format, arguments...)
+		return
+	}
+	log.Printf(format, arguments...)
+}
+
 func (u updater) logConfiguredZones(ctx context.Context, config Config) {
-	log.Print("Configured DNS zone entries at startup:")
+	u.logf("Configured DNS zone entries at startup:")
 	for _, domain := range config.Domains {
 		records, err := u.queryDNSZoneRecords(ctx, config, domain)
 		if err != nil {
-			log.Printf("\tDNS zone %s: ERR (%v)", normalizeDNSName(domain.Name), err)
+			u.logf("\tDNS zone %s: ERR (%v)", normalizeDNSName(domain.Name), err)
 			continue
 		}
 
-		log.Printf("\tDNS zone %s:", normalizeDNSName(domain.Name))
+		u.logf("\tDNS zone %s:", normalizeDNSName(domain.Name))
 		for _, record := range records {
-			log.Printf("\t\t%s", record.Raw)
+			u.logf("\t\t%s", record.Raw)
 		}
 	}
 }
@@ -308,12 +322,12 @@ func displayIPAddress(address string) string {
 func (u updater) externalIPs(ctx context.Context) (string, string, error) {
 	ipv4, ipv4Err := u.getIP(ctx, u.ipv4URL, false)
 	if ipv4Err != nil {
-		log.Printf("Unable to determine external IPv4 address: %v", ipv4Err)
+		u.logf("Unable to determine external IPv4 address: %v", ipv4Err)
 	}
 
 	ipv6, ipv6Err := u.getIP(ctx, u.ipv6URL, true)
 	if ipv6Err != nil {
-		log.Printf("Unable to determine external IPv6 address: %v", ipv6Err)
+		u.logf("Unable to determine external IPv6 address: %v", ipv6Err)
 	}
 
 	if ipv4Err != nil && ipv6Err != nil {
@@ -385,7 +399,7 @@ func (u updater) updateDomain(
 	ipv4 string,
 	ipv6 string,
 ) error {
-	log.Printf("Updating DNS zone %s...", normalizeDNSName(domain.Name))
+	u.logf("Updating DNS zone %s...", normalizeDNSName(domain.Name))
 
 	records, err := u.queryDNSZoneRecords(ctx, config, domain)
 	if err != nil {
@@ -397,7 +411,7 @@ func (u updater) updateDomain(
 		name := normalizeDNSName(subdomain)
 		values := buildSubdomainUpdateForm(config, domain, subdomain, records, ipv4, ipv6)
 		if !hasRecordChanges(values) {
-			log.Printf(
+			u.logf(
 				"\tUpdating subdomain %s to IPv4=%s IPv6=%s... OK (already current)",
 				name,
 				displayIPAddress(ipv4),
@@ -409,7 +423,7 @@ func (u updater) updateDomain(
 		if _, err := u.callAPI(ctx, values); err != nil {
 			updateErr := fmt.Errorf("update subdomain %s: %w", name, err)
 			updateErrors = append(updateErrors, updateErr)
-			log.Printf(
+			u.logf(
 				"\tUpdating subdomain %s to IPv4=%s IPv6=%s... ERR (%v)",
 				name,
 				displayIPAddress(ipv4),
@@ -418,7 +432,7 @@ func (u updater) updateDomain(
 			)
 			continue
 		}
-		log.Printf(
+		u.logf(
 			"\tUpdating subdomain %s to IPv4=%s IPv6=%s... OK",
 			name,
 			displayIPAddress(ipv4),
@@ -441,10 +455,10 @@ func (u updater) updateDomain(
 		name := normalizeDNSName(subdomain)
 		if err != nil {
 			verificationErrors = append(verificationErrors, err)
-			log.Printf("\tVerifying subdomain %s online... ERR (%v)", name, err)
+			u.logf("\tVerifying subdomain %s online... ERR (%v)", name, err)
 			continue
 		}
-		log.Printf("\tVerifying subdomain %s online... OK", name)
+		u.logf("\tVerifying subdomain %s online... OK", name)
 	}
 	return errors.Join(verificationErrors...)
 }
@@ -604,6 +618,13 @@ func parseDNSRecord(raw string) (dnsRecord, error) {
 }
 
 func (u updater) callAPI(ctx context.Context, values url.Values) (apiResponse, error) {
+	command := values.Get("command")
+	zone := normalizeDNSName(values.Get("dnszone"))
+	u.logf("Submitting UDR API request: command=%s zone=%s", command, zone)
+	for _, change := range recordChanges(values) {
+		u.logf("UDR DNS change: zone=%s %s=%q", zone, change.key, change.value)
+	}
+
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
@@ -611,42 +632,108 @@ func (u updater) callAPI(ctx context.Context, values url.Values) (apiResponse, e
 		strings.NewReader(values.Encode()),
 	)
 	if err != nil {
-		return apiResponse{}, fmt.Errorf("create %s request: %w", values.Get("command"), err)
+		updateErr := fmt.Errorf("create %s request: %w", command, err)
+		u.logf("UDR API request failed: command=%s zone=%s error=%v", command, zone, updateErr)
+		return apiResponse{}, updateErr
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	response, err := u.httpClient.Do(request)
 	if err != nil {
-		return apiResponse{}, fmt.Errorf("%s request: %w", values.Get("command"), err)
+		updateErr := fmt.Errorf("%s request: %w", command, err)
+		u.logf("UDR API request failed: command=%s zone=%s error=%v", command, zone, updateErr)
+		return apiResponse{}, updateErr
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodySize))
 	if err != nil {
-		return apiResponse{}, fmt.Errorf("read %s response: %w", values.Get("command"), err)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return apiResponse{}, fmt.Errorf(
-			"%s: HTTP %s: %s",
-			values.Get("command"),
+		updateErr := fmt.Errorf("read %s response: %w", command, err)
+		u.logf(
+			"UDR API request failed: command=%s zone=%s status=%s error=%v",
+			command,
+			zone,
 			response.Status,
-			strings.TrimSpace(string(body)),
+			updateErr,
 		)
+		return apiResponse{}, updateErr
+	}
+	responseBody := formatUDRResponse(body, values.Get("s_login"), values.Get("s_pw"))
+	u.logf(
+		"UDR API response: command=%s zone=%s status=%s body=%q",
+		command,
+		zone,
+		response.Status,
+		responseBody,
+	)
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		updateErr := fmt.Errorf(
+			"%s: HTTP %s: %s",
+			command,
+			response.Status,
+			responseBody,
+		)
+		u.logf("UDR API request failed: command=%s zone=%s error=%v", command, zone, updateErr)
+		return apiResponse{}, updateErr
 	}
 
 	apiResult, err := parseAPIResponse(string(body))
 	if err != nil {
-		return apiResponse{}, fmt.Errorf("parse %s response: %w", values.Get("command"), err)
+		updateErr := fmt.Errorf("parse %s response: %w", command, err)
+		u.logf("UDR API request failed: command=%s zone=%s error=%v", command, zone, updateErr)
+		return apiResponse{}, updateErr
 	}
 	if apiResult.Code != "200" {
-		return apiResponse{}, fmt.Errorf(
+		updateErr := fmt.Errorf(
 			"%s: API code %s: %s",
-			values.Get("command"),
+			command,
 			apiResult.Code,
 			apiResult.Description,
 		)
+		u.logf("UDR API request failed: command=%s zone=%s error=%v", command, zone, updateErr)
+		return apiResponse{}, updateErr
 	}
+	u.logf("UDR API request completed: command=%s zone=%s", command, zone)
 	return apiResult, nil
+}
+
+type recordChange struct {
+	key   string
+	value string
+}
+
+func recordChanges(values url.Values) []recordChange {
+	var changes []recordChange
+	for _, prefix := range []string{"delrr", "addrr"} {
+		for index := 0; ; index++ {
+			key := fmt.Sprintf("%s%d", prefix, index)
+			value := values.Get(key)
+			if value == "" {
+				break
+			}
+			changes = append(changes, recordChange{key: key, value: value})
+		}
+	}
+	return changes
+}
+
+// formatUDRResponse converts the provider response to a bounded, single-line
+// log value and redacts configured credentials if the API echoes them.
+func formatUDRResponse(body []byte, credentials ...string) string {
+	response := strings.TrimSpace(string(body))
+	response = strings.Join(strings.Fields(response), " ")
+	for _, credential := range credentials {
+		if credential != "" {
+			response = strings.ReplaceAll(response, credential, "[REDACTED]")
+		}
+	}
+	if response == "" {
+		return "<empty>"
+	}
+	if len(response) > maxLoggedBodySize {
+		return response[:maxLoggedBodySize] + "...[truncated]"
+	}
+	return response
 }
 
 func parseAPIResponse(body string) (apiResponse, error) {
