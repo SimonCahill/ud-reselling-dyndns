@@ -31,6 +31,8 @@ const (
 	defaultIPv6URL      = "https://ipv6.myexternalip.com/raw"
 	defaultPollInterval = time.Minute
 	defaultServiceName  = "UDResellingDynDNS"
+	maxResponseBodySize = 64 * 1024
+	maxLoggedBodySize   = 4 * 1024
 )
 
 // Config contains the reseller credentials and DNS zones managed by the
@@ -67,6 +69,7 @@ type updater struct {
 	ipv4URL    string
 	ipv6URL    string
 	httpClient *http.Client
+	logger     *log.Logger
 }
 
 // main loads configuration and delegates process lifecycle handling to the
@@ -98,6 +101,7 @@ func main() {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		logger: log.Default(),
 	}
 
 	run := func(ctx context.Context) error {
@@ -237,12 +241,12 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 	for {
 		ipv4, ipv6, err := u.externalIPs(ctx)
 		if err != nil {
-			log.Printf("Unable to determine external IP addresses: %v", err)
+			u.logf("Unable to determine external IP addresses: %v", err)
 		} else if ipv4 != lastIPv4 || ipv6 != lastIPv6 {
-			log.Printf("External IP address changed: IPv4=%s IPv6=%s", ipv4, ipv6)
+			u.logf("External IP address changed: IPv4=%s IPv6=%s", ipv4, ipv6)
 
 			if err := u.updateAllDomains(ctx, config, ipv4, ipv6); err != nil {
-				log.Printf("DNS update failed: %v", err)
+				u.logf("DNS update cycle failed: %v", err)
 			} else {
 				lastIPv4 = ipv4
 				lastIPv6 = ipv6
@@ -255,6 +259,16 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 		case <-ticker.C:
 		}
 	}
+}
+
+// logf writes through the updater's logger when one is configured and falls
+// back to the process-wide logger for callers that construct updater directly.
+func (u updater) logf(format string, arguments ...any) {
+	if u.logger != nil {
+		u.logger.Printf(format, arguments...)
+		return
+	}
+	log.Printf(format, arguments...)
 }
 
 // externalIPs retrieves and validates both public address families.
@@ -332,28 +346,137 @@ func (u updater) updateDomain(
 	ipv6 string,
 ) error {
 	values := buildUpdateForm(config, domain, ipv4, ipv6)
+	zone := normalizeDNSName(domain.Name)
+	records := updateRecords(values)
+
+	u.logf("Submitting UDR DNS update: zone=%s records=%d", zone, len(records))
+	for _, record := range records {
+		u.logf("UDR DNS change: zone=%s %s=%q", zone, record.key, record.value)
+	}
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.apiURL, strings.NewReader(values.Encode()))
 	if err != nil {
-		return fmt.Errorf("create update request for %s: %w", domain.Name, err)
+		updateErr := fmt.Errorf("create request: %w", err)
+		u.logf("UDR DNS update failed: zone=%s error=%v", zone, updateErr)
+		return fmt.Errorf("update domain %s: %w", zone, updateErr)
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	response, err := u.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("update domain %s: %w", domain.Name, err)
+		u.logf("UDR DNS update failed: zone=%s error=%v", zone, err)
+		return fmt.Errorf("update domain %s: %w", zone, err)
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodySize))
 	if err != nil {
-		return fmt.Errorf("read response for domain %s: %w", domain.Name, err)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("update domain %s: HTTP %s: %s", domain.Name, response.Status, strings.TrimSpace(string(body)))
+		u.logf("UDR DNS update failed: zone=%s status=%s error=read response: %v", zone, response.Status, err)
+		return fmt.Errorf("read response for domain %s: %w", zone, err)
 	}
 
-	log.Printf("Updated DNS zone %s", normalizeDNSName(domain.Name))
+	responseBody := formatUDRResponse(body, config.User, config.Password)
+	u.logf("UDR DNS response: zone=%s status=%s body=%q", zone, response.Status, responseBody)
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		updateErr := fmt.Errorf("HTTP %s: %s", response.Status, responseBody)
+		u.logf("UDR DNS update failed: zone=%s error=%v", zone, updateErr)
+		return fmt.Errorf("update domain %s: %w", zone, updateErr)
+	}
+	if responseIndicatesFailure(body) {
+		updateErr := fmt.Errorf("UDR reported failure: %s", responseBody)
+		u.logf("UDR DNS update failed: zone=%s error=%v", zone, updateErr)
+		return fmt.Errorf("update domain %s: %w", zone, updateErr)
+	}
+
+	u.logf("UDR DNS update request completed: zone=%s records=%d", zone, len(records))
 	return nil
+}
+
+type updateRecord struct {
+	key   string
+	value string
+}
+
+// updateRecords returns generated rrN fields in the order sent to UDR.
+func updateRecords(values url.Values) []updateRecord {
+	var records []updateRecord
+	for i := 0; ; i++ {
+		key := fmt.Sprintf("rr%d", i)
+		value := values.Get(key)
+		if value == "" {
+			return records
+		}
+		records = append(records, updateRecord{key: key, value: value})
+	}
+}
+
+// formatUDRResponse converts the provider response to a bounded, single-line
+// log value and redacts configured credentials if the API echoes them.
+func formatUDRResponse(body []byte, credentials ...string) string {
+	response := strings.TrimSpace(string(body))
+	response = strings.Join(strings.Fields(response), " ")
+	for _, credential := range credentials {
+		if credential != "" {
+			response = strings.ReplaceAll(response, credential, "[REDACTED]")
+		}
+	}
+	if response == "" {
+		return "<empty>"
+	}
+	if len(response) > maxLoggedBodySize {
+		return response[:maxLoggedBodySize] + "...[truncated]"
+	}
+	return response
+}
+
+// responseIndicatesFailure recognizes explicit failure fields in common JSON
+// and key-value API responses. Unknown response formats are still logged but
+// are not treated as failures solely based on free-form wording.
+func responseIndicatesFailure(body []byte) bool {
+	var object map[string]any
+	if json.Unmarshal(body, &object) == nil {
+		for key, value := range object {
+			if failureField(key, fmt.Sprint(value)) {
+				return true
+			}
+		}
+	}
+
+	for _, field := range strings.FieldsFunc(string(body), func(character rune) bool {
+		return character == '\n' || character == '\r' || character == '&' || character == ';'
+	}) {
+		key, value, found := strings.Cut(field, "=")
+		if !found {
+			key, value, found = strings.Cut(field, ":")
+		}
+		if found && failureField(key, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func failureField(key, value string) bool {
+	key = strings.ToLower(strings.Trim(strings.TrimSpace(key), `"'{}[]`))
+	value = strings.ToLower(strings.Trim(strings.TrimSpace(value), `"',{}[]`))
+
+	switch key {
+	case "error", "errors", "failure":
+		switch value {
+		case "", "0", "false", "no", "none", "null":
+			return false
+		default:
+			return true
+		}
+	case "success":
+		return value == "false" || value == "0" || value == "no"
+	case "status", "result":
+		return value == "error" || value == "failed" || value == "failure" ||
+			value == "denied" || value == "invalid"
+	default:
+		return false
+	}
 }
 
 // buildUpdateForm constructs the form fields expected by UpdateDNSZone.

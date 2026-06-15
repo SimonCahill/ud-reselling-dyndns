@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -147,6 +150,155 @@ func TestUpdateAllDomainsSendsOneRequestPerZone(t *testing.T) {
 	}
 	if got, want := requests[1].Get("dnszone"), "example.org."; got != want {
 		t.Errorf("second dnszone = %q, want %q", got, want)
+	}
+}
+
+func TestUpdateDomainLogsChangesAndResponse(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body: io.NopCloser(strings.NewReader(
+					"result=success\nmessage=updated by reseller-user using secret",
+				)),
+				Header:  make(http.Header),
+				Request: request,
+			}, nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	config := Config{User: "reseller-user", Password: "secret"}
+	domain := DomainConfig{Name: "example.com", Subdomains: []string{"home.example.com"}}
+
+	if err := u.updateDomain(context.Background(), config, domain, "192.0.2.10", "2001:db8::10"); err != nil {
+		t.Fatalf("updateDomain() error = %v", err)
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		`Submitting UDR DNS update: zone=example.com records=2`,
+		`rr0="home.example.com. 600 IN A 192.0.2.10"`,
+		`rr1="home.example.com. 600 IN AAAA 2001:db8::10"`,
+		`status=200 OK`,
+		`body="result=success message=updated by [REDACTED] using [REDACTED]"`,
+		`UDR DNS update request completed: zone=example.com records=2`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, config.User) || strings.Contains(output, config.Password) {
+		t.Errorf("logs contain credentials:\n%s", output)
+	}
+}
+
+func TestUpdateDomainLogsHTTPFailure(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Body:       io.NopCloser(strings.NewReader("error=invalid zone")),
+				Header:     make(http.Header),
+				Request:    request,
+			}, nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	config := Config{User: "user", Password: "password"}
+	domain := DomainConfig{Name: "example.com", Subdomains: []string{"home.example.com"}}
+
+	err := u.updateDomain(context.Background(), config, domain, "192.0.2.10", "2001:db8::10")
+	if err == nil {
+		t.Fatal("updateDomain() error = nil, want an error")
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		`UDR DNS response: zone=example.com status=400 Bad Request body="error=invalid zone"`,
+		`UDR DNS update failed: zone=example.com error=HTTP 400 Bad Request: error=invalid zone`,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestUpdateDomainLogsProviderFailureFromSuccessfulHTTPResponse(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(`{"success":false,"error":"invalid credentials"}`)),
+				Header:     make(http.Header),
+				Request:    request,
+			}, nil
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	config := Config{User: "user", Password: "password"}
+	domain := DomainConfig{Name: "example.com", Subdomains: []string{"home.example.com"}}
+
+	err := u.updateDomain(context.Background(), config, domain, "192.0.2.10", "2001:db8::10")
+	if err == nil {
+		t.Fatal("updateDomain() error = nil, want an error")
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "UDR reported failure") {
+		t.Errorf("provider failure was not logged:\n%s", output)
+	}
+	if strings.Contains(output, "request completed") {
+		t.Errorf("provider failure was logged as completed:\n%s", output)
+	}
+}
+
+func TestUpdateDomainLogsTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	client := &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connection refused")
+		}),
+	}
+	u := updater{
+		apiURL:     "https://api.example.test/update",
+		httpClient: client,
+		logger:     log.New(&logs, "", 0),
+	}
+	config := Config{User: "user", Password: "password"}
+	domain := DomainConfig{Name: "example.com", Subdomains: []string{"home.example.com"}}
+
+	if err := u.updateDomain(context.Background(), config, domain, "192.0.2.10", "2001:db8::10"); err == nil {
+		t.Fatal("updateDomain() error = nil, want an error")
+	}
+	if output := logs.String(); !strings.Contains(output, "UDR DNS update failed: zone=example.com") ||
+		!strings.Contains(output, "connection refused") {
+		t.Errorf("failure was not logged:\n%s", output)
 	}
 }
 
