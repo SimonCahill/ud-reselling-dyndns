@@ -2,11 +2,12 @@
 // Reselling API.
 //
 // The client periodically discovers the host's public IPv4 and IPv6
-// addresses. When either address changes, it replaces each configured DNS
-// zone with generated A and AAAA records for its configured hostnames.
+// addresses. When either address changes, it updates the configured hostnames
+// without modifying unrelated records in their DNS zones.
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -57,7 +58,7 @@ type DomainConfig struct {
 	Name string `json:"name"`
 
 	// Subdomains contains fully qualified names within Name. Each name
-	// receives one A and one AAAA record.
+	// receives records for the available address families.
 	Subdomains []string `json:"subdomains"`
 }
 
@@ -67,6 +68,20 @@ type updater struct {
 	ipv4URL    string
 	ipv6URL    string
 	httpClient *http.Client
+}
+
+type apiResponse struct {
+	Code        string
+	Description string
+	Properties  map[string][]string
+}
+
+type dnsRecord struct {
+	Raw   string
+	Name  string
+	TTL   string
+	Type  string
+	Value string
 }
 
 // main loads configuration and delegates process lifecycle handling to the
@@ -231,6 +246,8 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	u.logConfiguredZones(ctx, config)
+
 	var lastIPv4 string
 	var lastIPv6 string
 
@@ -239,7 +256,13 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 		if err != nil {
 			log.Printf("Unable to determine external IP addresses: %v", err)
 		} else if ipv4 != lastIPv4 || ipv6 != lastIPv6 {
-			log.Printf("External IP address changed: IPv4=%s IPv6=%s", ipv4, ipv6)
+			log.Printf(
+				"External IP address change detected: IPv4 %s -> %s, IPv6 %s -> %s",
+				displayIPAddress(lastIPv4),
+				displayIPAddress(ipv4),
+				displayIPAddress(lastIPv6),
+				displayIPAddress(ipv6),
+			)
 
 			if err := u.updateAllDomains(ctx, config, ipv4, ipv6); err != nil {
 				log.Printf("DNS update failed: %v", err)
@@ -257,16 +280,47 @@ func (u updater) run(ctx context.Context, config Config, pollInterval time.Durat
 	}
 }
 
-// externalIPs retrieves and validates both public address families.
+func (u updater) logConfiguredZones(ctx context.Context, config Config) {
+	log.Print("Configured DNS zone entries at startup:")
+	for _, domain := range config.Domains {
+		records, err := u.queryDNSZoneRecords(ctx, config, domain)
+		if err != nil {
+			log.Printf("\tDNS zone %s: ERR (%v)", normalizeDNSName(domain.Name), err)
+			continue
+		}
+
+		log.Printf("\tDNS zone %s:", normalizeDNSName(domain.Name))
+		for _, record := range records {
+			log.Printf("\t\t%s", record.Raw)
+		}
+	}
+}
+
+func displayIPAddress(address string) string {
+	if address == "" {
+		return "unavailable"
+	}
+	return address
+}
+
+// externalIPs retrieves and validates both public address families. A lookup
+// failure is tolerated when the other address family is available.
 func (u updater) externalIPs(ctx context.Context) (string, string, error) {
-	ipv4, err := u.getIP(ctx, u.ipv4URL, false)
-	if err != nil {
-		return "", "", fmt.Errorf("get IPv4 address: %w", err)
+	ipv4, ipv4Err := u.getIP(ctx, u.ipv4URL, false)
+	if ipv4Err != nil {
+		log.Printf("Unable to determine external IPv4 address: %v", ipv4Err)
 	}
 
-	ipv6, err := u.getIP(ctx, u.ipv6URL, true)
-	if err != nil {
-		return "", "", fmt.Errorf("get IPv6 address: %w", err)
+	ipv6, ipv6Err := u.getIP(ctx, u.ipv6URL, true)
+	if ipv6Err != nil {
+		log.Printf("Unable to determine external IPv6 address: %v", ipv6Err)
+	}
+
+	if ipv4Err != nil && ipv6Err != nil {
+		return "", "", errors.Join(
+			fmt.Errorf("get IPv4 address: %w", ipv4Err),
+			fmt.Errorf("get IPv6 address: %w", ipv6Err),
+		)
 	}
 
 	return ipv4, ipv6, nil
@@ -310,8 +364,8 @@ func (u updater) getIP(ctx context.Context, endpoint string, wantIPv6 bool) (str
 	return address, nil
 }
 
-// updateAllDomains submits one independent API request per configured DNS
-// zone. It attempts every zone and joins any errors for the caller.
+// updateAllDomains updates every configured DNS zone. It attempts every zone
+// and joins any errors for the caller.
 func (u updater) updateAllDomains(ctx context.Context, config Config, ipv4, ipv6 string) error {
 	var updateErrors []error
 	for _, domain := range config.Domains {
@@ -322,8 +376,8 @@ func (u updater) updateAllDomains(ctx context.Context, config Config, ipv4, ipv6
 	return errors.Join(updateErrors...)
 }
 
-// updateDomain replaces one DNS zone with records generated from domain and
-// the current public addresses.
+// updateDomain updates only the A and AAAA records for configured subdomains,
+// then queries the online zone again to verify the changes.
 func (u updater) updateDomain(
 	ctx context.Context,
 	config Config,
@@ -331,57 +385,313 @@ func (u updater) updateDomain(
 	ipv4 string,
 	ipv6 string,
 ) error {
-	values := buildUpdateForm(config, domain, ipv4, ipv6)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, u.apiURL, strings.NewReader(values.Encode()))
+	log.Printf("Updating DNS zone %s...", normalizeDNSName(domain.Name))
+
+	records, err := u.queryDNSZoneRecords(ctx, config, domain)
 	if err != nil {
-		return fmt.Errorf("create update request for %s: %w", domain.Name, err)
+		return fmt.Errorf("query DNS zone %s before update: %w", domain.Name, err)
+	}
+
+	var updateErrors []error
+	for _, subdomain := range domain.Subdomains {
+		name := normalizeDNSName(subdomain)
+		values := buildSubdomainUpdateForm(config, domain, subdomain, records, ipv4, ipv6)
+		if !hasRecordChanges(values) {
+			log.Printf(
+				"\tUpdating subdomain %s to IPv4=%s IPv6=%s... OK (already current)",
+				name,
+				displayIPAddress(ipv4),
+				displayIPAddress(ipv6),
+			)
+			continue
+		}
+
+		if _, err := u.callAPI(ctx, values); err != nil {
+			updateErr := fmt.Errorf("update subdomain %s: %w", name, err)
+			updateErrors = append(updateErrors, updateErr)
+			log.Printf(
+				"\tUpdating subdomain %s to IPv4=%s IPv6=%s... ERR (%v)",
+				name,
+				displayIPAddress(ipv4),
+				displayIPAddress(ipv6),
+				err,
+			)
+			continue
+		}
+		log.Printf(
+			"\tUpdating subdomain %s to IPv4=%s IPv6=%s... OK",
+			name,
+			displayIPAddress(ipv4),
+			displayIPAddress(ipv6),
+		)
+	}
+
+	if err := errors.Join(updateErrors...); err != nil {
+		return err
+	}
+
+	onlineRecords, err := u.queryDNSZoneRecords(ctx, config, domain)
+	if err != nil {
+		return fmt.Errorf("query DNS zone %s after update: %w", domain.Name, err)
+	}
+
+	var verificationErrors []error
+	for _, subdomain := range domain.Subdomains {
+		err := verifySubdomainRecords(subdomain, onlineRecords, ipv4, ipv6)
+		name := normalizeDNSName(subdomain)
+		if err != nil {
+			verificationErrors = append(verificationErrors, err)
+			log.Printf("\tVerifying subdomain %s online... ERR (%v)", name, err)
+			continue
+		}
+		log.Printf("\tVerifying subdomain %s online... OK", name)
+	}
+	return errors.Join(verificationErrors...)
+}
+
+func (u updater) queryDNSZoneRecords(
+	ctx context.Context,
+	config Config,
+	domain DomainConfig,
+) ([]dnsRecord, error) {
+	response, err := u.callAPI(ctx, url.Values{
+		"s_login": {config.User},
+		"s_pw":    {config.Password},
+		"command": {"QueryDNSZoneRRList"},
+		"dnszone": {absoluteDNSName(domain.Name)},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	rawRecords := response.Properties["rr"]
+	records := make([]dnsRecord, 0, len(rawRecords))
+	for _, rawRecord := range rawRecords {
+		record, err := parseDNSRecord(rawRecord)
+		if err != nil {
+			return nil, fmt.Errorf("parse DNS record %q: %w", rawRecord, err)
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func buildSubdomainUpdateForm(
+	config Config,
+	domain DomainConfig,
+	subdomain string,
+	records []dnsRecord,
+	ipv4 string,
+	ipv6 string,
+) url.Values {
+	values := url.Values{
+		"s_login": {config.User},
+		"s_pw":    {config.Password},
+		"command": {"UpdateDNSZone"},
+		"dnszone": {absoluteDNSName(domain.Name)},
+	}
+
+	name := normalizeDNSName(subdomain)
+	deleteIndex := 0
+	for _, record := range records {
+		if record.Name == name && (record.Type == "A" || record.Type == "AAAA") {
+			values.Set(fmt.Sprintf("delrr%d", deleteIndex), record.Raw)
+			deleteIndex++
+		}
+	}
+
+	addIndex := 0
+	if ipv4 != "" {
+		values.Set(
+			fmt.Sprintf("addrr%d", addIndex),
+			fmt.Sprintf("%s 600 IN A %s", absoluteDNSName(subdomain), ipv4),
+		)
+		addIndex++
+	}
+	if ipv6 != "" {
+		values.Set(
+			fmt.Sprintf("addrr%d", addIndex),
+			fmt.Sprintf("%s 600 IN AAAA %s", absoluteDNSName(subdomain), ipv6),
+		)
+	}
+	return values
+}
+
+func hasRecordChanges(values url.Values) bool {
+	for key := range values {
+		if strings.HasPrefix(key, "addrr") || strings.HasPrefix(key, "delrr") {
+			return true
+		}
+	}
+	return false
+}
+
+func verifySubdomainRecords(subdomain string, records []dnsRecord, ipv4, ipv6 string) error {
+	name := normalizeDNSName(subdomain)
+	want := map[string]string{}
+	if ipv4 != "" {
+		want["A"] = ipv4
+	}
+	if ipv6 != "" {
+		want["AAAA"] = ipv6
+	}
+
+	found := make(map[string]int)
+	for _, record := range records {
+		if record.Name != name || (record.Type != "A" && record.Type != "AAAA") {
+			continue
+		}
+
+		wantValue, exists := want[record.Type]
+		if !exists {
+			return fmt.Errorf("unexpected %s record %q remains online", record.Type, record.Raw)
+		}
+		if !ipAddressesEqual(record.Value, wantValue) {
+			return fmt.Errorf("%s record is %s, want %s", record.Type, record.Value, wantValue)
+		}
+		if record.TTL != "600" {
+			return fmt.Errorf("%s record TTL is %s, want 600", record.Type, record.TTL)
+		}
+		found[record.Type]++
+	}
+
+	for recordType := range want {
+		if found[recordType] != 1 {
+			return fmt.Errorf(
+				"found %d matching %s records, want exactly 1",
+				found[recordType],
+				recordType,
+			)
+		}
+	}
+	return nil
+}
+
+func ipAddressesEqual(first, second string) bool {
+	firstIP := net.ParseIP(first)
+	secondIP := net.ParseIP(second)
+	return firstIP != nil && secondIP != nil && firstIP.Equal(secondIP)
+}
+
+func parseDNSRecord(raw string) (dnsRecord, error) {
+	fields := strings.Fields(raw)
+	if len(fields) < 4 {
+		return dnsRecord{}, errors.New("record has fewer than four fields")
+	}
+
+	inIndex := -1
+	for i, field := range fields {
+		if strings.EqualFold(field, "IN") {
+			inIndex = i
+			break
+		}
+	}
+	if inIndex < 1 || inIndex+2 >= len(fields) {
+		return dnsRecord{}, errors.New("record does not contain an IN class, type, and value")
+	}
+
+	ttl := ""
+	if inIndex > 1 {
+		ttl = fields[inIndex-1]
+	}
+	return dnsRecord{
+		Raw:   strings.TrimSpace(raw),
+		Name:  normalizeDNSName(fields[0]),
+		TTL:   ttl,
+		Type:  strings.ToUpper(fields[inIndex+1]),
+		Value: strings.Join(fields[inIndex+2:], " "),
+	}, nil
+}
+
+func (u updater) callAPI(ctx context.Context, values url.Values) (apiResponse, error) {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		u.apiURL,
+		strings.NewReader(values.Encode()),
+	)
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("create %s request: %w", values.Get("command"), err)
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	response, err := u.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("update domain %s: %w", domain.Name, err)
+		return apiResponse{}, fmt.Errorf("%s request: %w", values.Get("command"), err)
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
 	if err != nil {
-		return fmt.Errorf("read response for domain %s: %w", domain.Name, err)
+		return apiResponse{}, fmt.Errorf("read %s response: %w", values.Get("command"), err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("update domain %s: HTTP %s: %s", domain.Name, response.Status, strings.TrimSpace(string(body)))
-	}
-
-	log.Printf("Updated DNS zone %s", normalizeDNSName(domain.Name))
-	return nil
-}
-
-// buildUpdateForm constructs the form fields expected by UpdateDNSZone.
-// Record numbering is contiguous, with one A and one AAAA record for each
-// configured subdomain.
-func buildUpdateForm(config Config, domain DomainConfig, ipv4, ipv6 string) url.Values {
-	domainName := absoluteDNSName(domain.Name)
-
-	values := url.Values{
-		"s_login": {config.User},
-		"s_pw":    {config.Password},
-		"command": {"UpdateDNSZone"},
-		"dnszone": {domainName},
-	}
-
-	var records []string
-	for _, subdomain := range domain.Subdomains {
-		name := absoluteDNSName(subdomain)
-		records = append(records,
-			fmt.Sprintf("%s 600 IN A %s", name, ipv4),
-			fmt.Sprintf("%s 600 IN AAAA %s", name, ipv6),
+		return apiResponse{}, fmt.Errorf(
+			"%s: HTTP %s: %s",
+			values.Get("command"),
+			response.Status,
+			strings.TrimSpace(string(body)),
 		)
 	}
 
-	for i, record := range records {
-		values.Set(fmt.Sprintf("rr%d", i), record)
+	apiResult, err := parseAPIResponse(string(body))
+	if err != nil {
+		return apiResponse{}, fmt.Errorf("parse %s response: %w", values.Get("command"), err)
 	}
-	return values
+	if apiResult.Code != "200" {
+		return apiResponse{}, fmt.Errorf(
+			"%s: API code %s: %s",
+			values.Get("command"),
+			apiResult.Code,
+			apiResult.Description,
+		)
+	}
+	return apiResult, nil
+}
+
+func parseAPIResponse(body string) (apiResponse, error) {
+	response := apiResponse{Properties: make(map[string][]string)}
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+
+		switch strings.ToLower(key) {
+		case "code":
+			response.Code = value
+		case "description":
+			response.Description = value
+		default:
+			if propertyName, ok := apiPropertyName(key); ok {
+				response.Properties[propertyName] = append(response.Properties[propertyName], value)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return apiResponse{}, err
+	}
+	if response.Code == "" {
+		return apiResponse{}, errors.New("response code is missing")
+	}
+	return response, nil
+}
+
+func apiPropertyName(key string) (string, bool) {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	const prefix = "property["
+	if !strings.HasPrefix(lowerKey, prefix) {
+		return "", false
+	}
+	end := strings.Index(lowerKey[len(prefix):], "]")
+	if end < 0 {
+		return "", false
+	}
+	return lowerKey[len(prefix) : len(prefix)+end], true
 }
 
 // normalizeDNSName trims whitespace and a trailing dot, then lowercases a DNS
