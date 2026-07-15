@@ -286,12 +286,19 @@ GitHub Actions builds, tests, and uploads binaries for:
 - Linux x86-64, armhf (`GOARM=7`), and aarch64.
 - macOS ARM64.
 
-The container workflow builds Linux images for amd64, arm/v7, and arm64. Every
-branch push, version tag, and manual workflow run publishes the image to GitHub
-Container Registry under `ghcr.io/simoncahill/ud-reselling-dyndns`. Every push
-to `master` also publishes `latest`; version tags such as `v1.2.3` publish
-semantic version tags. Registry authentication and publication are mandatory,
-so either failure fails the workflow. Pull requests run the binary build and
-test workflow, but do not invoke the publishing workflow.
+The container workflow builds Linux images for amd64, arm/v7, and arm64 under
+`ghcr.io/simoncahill/ud-reselling-dyndns`. Published channels are deliberately
+separate:
+
+- `master` builds publish `latest`.
+- Other branch builds publish `latest-devel`.
+- Pull requests publish `pr-<number>` when the branch belongs to this
+  repository. Forked pull requests build without registry credentials and are
+  not pushed.
+- Version tags such as `v1.2.3` publish `1.2.3` and `1.2` image tags.
+
+All builds also receive an immutable `sha-<commit>` tag when they are pushed.
+The same Git tag, development commit, or PR number is embedded in the binary
+inside the image and is available through `-version`.
 
 The software is provided without warranty.
