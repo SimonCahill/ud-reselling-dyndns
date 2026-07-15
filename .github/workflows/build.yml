@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  APP_VERSION: ${{ github.event_name == 'pull_request' && format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || (github.ref_type == 'tag' && github.ref_name || format('devel-{0}', github.sha)) }}
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -73,7 +76,7 @@ jobs:
           mkdir -p "dist/${{ matrix.artifact }}"
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X main.version=${APP_VERSION}" \
             -o "dist/${{ matrix.artifact }}/${{ matrix.binary }}" \
             ./src
           cp config.json.example "dist/${{ matrix.artifact }}/"
@@ -139,7 +142,7 @@ jobs:
         run: |
           go build \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X main.version=${APP_VERSION}" \
             -o dist/linux-armhf/ud-reselling-dyndns \
             ./src
           rm dist/linux-armhf/ud-reselling-dyndns-tests

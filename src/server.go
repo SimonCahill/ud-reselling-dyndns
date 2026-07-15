@@ -102,7 +102,13 @@ func main() {
     configPath := flag.String("config", "config.json", "path to the JSON configuration file")
     logPath := flag.String("log", "", "optional path to an append-only log file")
     serviceName := flag.String("service-name", defaultServiceName, "Windows service name")
+    showVersion := flag.Bool("version", false, "print application version and exit")
     flag.Parse()
+
+    if *showVersion {
+        fmt.Println(applicationVersionOutput())
+        return
+    }
 
     if err := configureLogging(*logPath); err != nil {
         log.Fatal(err)

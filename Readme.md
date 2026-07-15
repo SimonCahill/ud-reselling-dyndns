@@ -120,6 +120,19 @@ The resulting binary is statically built and placed in `bin/`.
 Use `-log /path/to/file.log` to write logs to a file instead of standard
 error.
 
+Print the version embedded at build time:
+
+```sh
+./bin/ud-reselling-dyndns -version
+```
+
+Local Make builds derive their version from `git describe`. Override it for a
+reproducible build when needed:
+
+```sh
+make standalone VERSION=v1.2.3
+```
+
 Each UDR update logs:
 
 - The API command and DNS zone.

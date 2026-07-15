@@ -214,7 +214,7 @@ func TestDynDNS2ProviderSendsOneAuthenticatedRequestPerHostname(t *testing.T) {
         if !ok || user != "user" || password != "password" {
             t.Errorf("request[%d] BasicAuth = %q, %q, %v", i, user, password, ok)
         }
-        if request.UserAgent() != dynDNS2UserAgent {
+        if request.UserAgent() != applicationUserAgent() {
             t.Errorf("request[%d] User-Agent = %q", i, request.UserAgent())
         }
     }

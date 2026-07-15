@@ -18,7 +18,6 @@ const (
     // The DynDNS v2 specification requires a substantial pause after server
     // failure responses such as 911 and dnserr.
     dynDNS2Cooldown      = 30 * time.Minute
-    dynDNS2UserAgent     = "ud-reselling-dyndns/1"
 )
 
 // publishedAddresses is the last address pair successfully sent by a provider.
@@ -203,7 +202,7 @@ func (provider *dynDNS2Provider) updateHostname(
         return dynDNS2Outcome{}, err
     }
     request.SetBasicAuth(provider.user, provider.password)
-    request.Header.Set("User-Agent", dynDNS2UserAgent)
+    request.Header.Set("User-Agent", applicationUserAgent())
 
     provider.updater.logf(
         "Submitting DynDNS v2 request: provider=%s hostname=%s address=%s",
