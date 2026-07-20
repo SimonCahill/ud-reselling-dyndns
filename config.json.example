@@ -1,19 +1,31 @@
 {
-  "user": "reseller-user",
-  "password": "replace-me",
   "pollInterval": "1m",
-  "domains": [
+  "providers": [
     {
-      "name": "example.com",
-      "subdomains": [
-        "home.example.com",
-        "vpn.example.com"
+      "name": "primary-udr",
+      "type": "udr",
+      "user": "reseller-user",
+      "password": "replace-me",
+      "domains": [
+        {
+          "name": "example.com",
+          "subdomains": [
+            "home.example.com",
+            "vpn.example.com"
+          ]
+        }
       ]
     },
     {
-      "name": "example.net",
-      "subdomains": [
-        "home.example.net"
+      "name": "secondary-ddns",
+      "type": "dyndns2",
+      "updateUrl": "https://provider.example/nic/update",
+      "user": "account-name",
+      "password": "replace-me",
+      "addressFamily": "both",
+      "hostnames": [
+        "home.example.net",
+        "vpn.example.net"
       ]
     }
   ]

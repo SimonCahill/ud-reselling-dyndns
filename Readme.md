@@ -1,16 +1,18 @@
-# United Domains Reselling DynDNS
+# United Domains Reselling and DynDNS v2 Client
 
 This application reads the public IPv4 and IPv6 addresses of the host and
-updates one or more DNS zones through the United Domains Reselling API.
+updates hostnames through one or more providers. It supports the United Domains
+Reselling API and generic HTTPS endpoints implementing the DynDNS v2 (Members
+NIC Update) protocol.
 
 On startup, and then at the configured interval, it:
 
-1. Queries and logs every existing record in each configured DNS zone.
+1. Queries and logs every existing record in each configured UDR DNS zone.
 2. Fetches the available public IPv4 and IPv6 addresses.
 3. Detects address changes.
-4. Replaces only the A and AAAA records for each configured subdomain.
-5. Queries the online zone again and verifies that the requested records are
-   present.
+4. Updates each configured provider and hostname.
+5. For UDR zones, replaces only the configured A and AAAA records and verifies
+   the online zone afterward.
 
 Unconfigured records in the same DNS zone, including NS, MX, TXT, and records
 for other hostnames, are left unchanged.
@@ -25,6 +27,49 @@ cp config.json.example config.json
 chmod 600 config.json
 ```
 
+The canonical configuration supports any combination of providers:
+
+```json
+{
+  "pollInterval": "1m",
+  "providers": [
+    {
+      "name": "primary-udr",
+      "type": "udr",
+      "user": "reseller-user",
+      "password": "replace-me",
+      "domains": [
+        {
+          "name": "example.com",
+          "subdomains": ["home.example.com", "vpn.example.com"]
+        }
+      ]
+    },
+    {
+      "name": "secondary-ddns",
+      "type": "dyndns2",
+      "updateUrl": "https://provider.example/nic/update",
+      "user": "account-name",
+      "password": "replace-me",
+      "addressFamily": "both",
+      "hostnames": ["home.example.net", "vpn.example.net"]
+    }
+  ]
+}
+```
+
+Provider names must be unique. `type` is either `udr` or `dyndns2`. A DynDNS
+v2 provider sends one authenticated HTTPS request per hostname and accepts an
+`addressFamily` of `ipv4`, `ipv6`, or `both`; the default is `both`. Existing
+query parameters in `updateUrl` are retained, while `hostname` and `myip` are
+set by the application. Plain HTTP endpoints are rejected to prevent Basic
+authentication credentials from being exposed.
+
+### Existing configurations remain supported
+
+Upgrading the application does not require changing an existing configuration.
+The original top-level UDR schema continues to load and behaves as before:
+
 ```json
 {
   "user": "reseller-user",
@@ -33,26 +78,33 @@ chmod 600 config.json
   "domains": [
     {
       "name": "example.com",
-      "subdomains": [
-        "home.example.com",
-        "vpn.example.com"
-      ]
-    },
-    {
-      "name": "example.net",
-      "subdomains": [
-        "home.example.net"
-      ]
+      "subdomains": ["home.example.com", "vpn.example.com"]
     }
   ]
 }
 ```
+
+Legacy configurations are normalized in memory only. They are never rewritten,
+and legacy fields cannot be mixed with the new `providers` array in the same
+file.
 
 `pollInterval` accepts a Go duration such as `30s`, `1m`, or `5m` and defaults
 to `1m`. Domain names may include a trailing dot. Every subdomain must be a
 fully qualified name within its associated domain.
 
 The old `properties.ini` format is no longer supported.
+
+## DynDNS v2 behavior
+
+DynDNS v2 requests use HTTP Basic authentication, the `hostname` and `myip`
+query parameters, and a versioned `User-Agent`. `good` and `nochg` responses
+are successful. Account and configuration failures disable the affected
+provider or hostname until the process restarts, preventing abusive retries.
+The temporary `911` and `dnserr` responses pause the affected hostname for 30
+minutes. Transport and server failures retry at the normal polling interval.
+
+Successful hostnames remember the last published address independently, so a
+failure at one provider does not cause unnecessary updates to another.
 
 ## Standalone Build
 
@@ -67,6 +119,19 @@ The resulting binary is statically built and placed in `bin/`.
 
 Use `-log /path/to/file.log` to write logs to a file instead of standard
 error.
+
+Print the version embedded at build time:
+
+```sh
+./bin/ud-reselling-dyndns -version
+```
+
+Local Make builds derive their version from `git describe`. Override it for a
+reproducible build when needed:
+
+```sh
+make standalone VERSION=v1.2.3
+```
 
 Each UDR update logs:
 
@@ -221,12 +286,19 @@ GitHub Actions builds, tests, and uploads binaries for:
 - Linux x86-64, armhf (`GOARM=7`), and aarch64.
 - macOS ARM64.
 
-The container workflow builds Linux images for amd64, arm/v7, and arm64. Every
-branch push, version tag, and manual workflow run publishes the image to GitHub
-Container Registry under `ghcr.io/simoncahill/ud-reselling-dyndns`. Every push
-to `master` also publishes `latest`; version tags such as `v1.2.3` publish
-semantic version tags. Registry authentication and publication are mandatory,
-so either failure fails the workflow. Pull requests run the binary build and
-test workflow, but do not invoke the publishing workflow.
+The container workflow builds Linux images for amd64, arm/v7, and arm64 under
+`ghcr.io/simoncahill/ud-reselling-dyndns`. Published channels are deliberately
+separate:
+
+- `master` builds publish `latest`.
+- Other branch builds publish `latest-devel`.
+- Pull requests publish `pr-<number>` when the branch belongs to this
+  repository. Forked pull requests build without registry credentials and are
+  not pushed.
+- Version tags such as `v1.2.3` publish `1.2.3` and `1.2` image tags.
+
+All builds also receive an immutable `sha-<commit>` tag when they are pushed.
+The same Git tag, development commit, or PR number is embedded in the binary
+inside the image and is available through `-version`.
 
 The software is provided without warranty.
